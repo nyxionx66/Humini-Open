@@ -128,14 +128,22 @@ export default {
                 case 'greeting':
                     await this.handleGreetingCommand(bot, username);
                     break;
+                case 'give_specific_item':
+                    await this.handleGiveSpecificItemCommand(bot, username, message);
+                    break;
                 default:
-                    // Generate AI response for normal chat
-                    const response = await this.generateAIResponse(bot, username, message);
+                    // Check for advanced commands in the message
+                    if (message.toLowerCase().includes('make fully advanced')) {
+                        await this.handleAdvancedCommand(bot, username, message);
+                    } else {
+                        // Generate AI response for normal chat
+                        const response = await this.generateAIResponse(bot, username, message);
 
-                    if (response) {
-                        // Send the response in-game
-                        bot.chat(response);
-                        Logger.info(`Sent AI response to ${username}`);
+                        if (response) {
+                            // Send the response in-game
+                            bot.chat(response);
+                            Logger.info(`Sent AI response to ${username}`);
+                        }
                     }
             }
         } catch (error) {
@@ -144,6 +152,33 @@ export default {
         } finally {
             // Clear the pending request
             bot.aiChat.pendingRequests.delete(username);
+        }
+    },
+
+    async handleAdvancedCommand(bot, username, message) {
+        try {
+            Logger.info(`Processing advanced command from ${username}`);
+            
+            // First, stop following if currently following
+            if (bot.followingPlayer) {
+                await this.handleStopFollowingCommand(bot, username);
+            }
+            
+            // Try to extract an item name from the message
+            const itemName = await this.extractItemFromMessage(bot, message);
+            
+            if (itemName) {
+                // If an item was mentioned, try to give it
+                await this.handleGiveSpecificItemCommand(bot, username, message);
+            } else {
+                // No specific item mentioned, just acknowledge the command
+                bot.chat(`I'm now in advanced mode, ${username}. What would you like me to do?`);
+            }
+            
+            Logger.success(`Processed advanced command for ${username}`);
+        } catch (error) {
+            Logger.error(`Error in advanced command: ${error.message}`);
+            bot.chat(`Sorry ${username}, I couldn't process that advanced command.`);
         }
     },
 
@@ -161,7 +196,7 @@ export default {
                     messages: [
                         {
                             role: 'system',
-                            content: 'You are an intent classifier for a Minecraft bot. Classify the intent of the message into one of these categories: follow, give_item, come_here, stop_following, inventory, greeting, other. Only respond with the category name, nothing else.'
+                            content: 'You are an intent classifier for a Minecraft bot. Classify the intent of the message into one of these categories: follow, give_item, come_here, stop_following, inventory, greeting, give_specific_item, other. Only respond with the category name, nothing else.'
                         },
                         {
                             role: 'user',
@@ -184,6 +219,7 @@ export default {
 
                 // Map the intent to one of our categories
                 if (intent.includes('follow')) return 'follow';
+                if (intent.includes('give') && intent.includes('specific')) return 'give_specific_item';
                 if (intent.includes('give') || intent.includes('item')) return 'give_item';
                 if (intent.includes('come')) return 'come_here';
                 if (intent.includes('stop')) return 'stop_following';
@@ -338,6 +374,63 @@ export default {
         }
     },
 
+    async handleGiveSpecificItemCommand(bot, username, message) {
+        try {
+            // Extract what the player wants with more detailed analysis
+            const itemDetails = await this.extractSpecificItemDetails(bot, message);
+            
+            if (!itemDetails || !itemDetails.name) {
+                bot.chat(`What specific item would you like me to give you, ${username}?`);
+                return;
+            }
+            
+            const itemName = itemDetails.name;
+            const count = itemDetails.count || 1;
+            
+            // Check if the give command is available
+            if (!bot.commandManager) {
+                bot.chat(`I'd like to give you ${count}x ${itemName}, but I can't right now.`);
+                Logger.warn('Command manager not available for give command');
+                return;
+            }
+
+            // Get the give command
+            const giveCommand = bot.commandManager.getCommand('give');
+
+            if (!giveCommand) {
+                bot.chat(`I'd like to give you ${count}x ${itemName}, but I can't right now.`);
+                Logger.warn('Give command not found');
+                return;
+            }
+
+            // Check if we have the item
+            const items = InventoryUtils.findItems(bot, itemName, { partialMatch: true });
+
+            if (items.length === 0) {
+                bot.chat(`Sorry ${username}, I don't have any ${itemName}.`);
+                return;
+            }
+
+            // Check if we have enough of the item
+            const availableCount = items.reduce((total, item) => total + item.count, 0);
+            const actualCount = Math.min(count, availableCount);
+            
+            if (actualCount < count) {
+                bot.chat(`I only have ${actualCount}x ${itemName}, but I'll give you what I can.`);
+            }
+
+            // Execute the give command
+            giveCommand.execute(bot, [username, actualCount.toString(), itemName], bot.huminiConfig);
+
+            // Send a response
+            bot.chat(`Here's your ${actualCount}x ${itemName}, ${username}!`);
+            Logger.info(`Gave ${actualCount}x ${itemName} to ${username} via AI command`);
+        } catch (error) {
+            Logger.error(`Error in give specific item command: ${error.message}`);
+            bot.chat(`Sorry, I couldn't give you that specific item: ${error.message}`);
+        }
+    },
+
     async handleInventoryCommand(bot, username) {
         try {
             // Get a list of items in the bot's inventory
@@ -466,6 +559,126 @@ export default {
         } catch (error) {
             Logger.error(`Error extracting item from message: ${error.message}`);
             return null;
+        }
+    },
+
+    async extractSpecificItemDetails(bot, message) {
+        try {
+            const apiKey = bot.aiChat.apiKey;
+            const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                body: JSON.stringify({
+                    model: 'mistral-tiny',
+                    messages: [
+                        {
+                            role: 'system',
+                            content: 'You are an assistant that extracts item details from messages. Respond with a JSON object containing "name" (string) and "count" (number) properties. If no item is mentioned, set name to null. If no count is specified, default to 1.'
+                        },
+                        {
+                            role: 'user',
+                            content: `Extract the Minecraft item details from this message: "${message}"`
+                        }
+                    ],
+                    max_tokens: 100,
+                    temperature: 0.3
+                })
+            });
+
+            if (!response.ok) {
+                return { name: null, count: 1 };
+            }
+
+            const data = await response.json();
+
+            if (data.choices && data.choices.length > 0) {
+                const content = data.choices[0].message.content.trim();
+                
+                try {
+                    // Try to parse as JSON
+                    const jsonMatch = content.match(/\{.*\}/s);
+                    if (jsonMatch) {
+                        const itemDetails = JSON.parse(jsonMatch[0]);
+                        
+                        // Validate and clean up the item name
+                        if (itemDetails.name && typeof itemDetails.name === 'string') {
+                            let itemName = itemDetails.name.toLowerCase();
+                            
+                            // Clean up the item name
+                            itemName = itemName.replace(/^(a|an|the|some) /i, '');
+                            
+                            // Convert common item names to Minecraft format
+                            const itemMappings = {
+                                'wood': 'log',
+                                'wooden planks': 'planks',
+                                'stone': 'cobblestone',
+                                'iron': 'iron_ingot',
+                                'gold': 'gold_ingot',
+                                'diamond': 'diamond',
+                                'stick': 'stick',
+                                'coal': 'coal',
+                                'food': 'bread',
+                                'sword': 'iron_sword',
+                                'pickaxe': 'iron_pickaxe',
+                                'axe': 'iron_axe',
+                                'shovel': 'iron_shovel',
+                                'hoe': 'iron_hoe',
+                                'bow': 'bow',
+                                'arrow': 'arrow',
+                                'torch': 'torch',
+                                'dirt': 'dirt',
+                                'sand': 'sand',
+                                'gravel': 'gravel',
+                                'apple': 'apple'
+                            };
+                            
+                            // Check if we have a mapping for this item
+                            if (itemMappings[itemName]) {
+                                itemName = itemMappings[itemName];
+                            }
+                            
+                            // Ensure count is a number
+                            const count = typeof itemDetails.count === 'number' ? 
+                                itemDetails.count : 
+                                parseInt(itemDetails.count) || 1;
+                                
+                            return {
+                                name: itemName,
+                                count: Math.max(1, count) // Ensure count is at least 1
+                            };
+                        }
+                    }
+                    
+                    // If JSON parsing failed, try to extract manually
+                    const itemName = await this.extractItemFromMessage(bot, message);
+                    
+                    // Try to find a number in the message
+                    const countMatch = message.match(/\b(\d+)\b/);
+                    const count = countMatch ? parseInt(countMatch[1]) : 1;
+                    
+                    return {
+                        name: itemName,
+                        count: count
+                    };
+                } catch (parseError) {
+                    Logger.error(`Error parsing item details: ${parseError.message}`);
+                    
+                    // Fallback to basic extraction
+                    const itemName = await this.extractItemFromMessage(bot, message);
+                    return {
+                        name: itemName,
+                        count: 1
+                    };
+                }
+            }
+
+            return { name: null, count: 1 };
+        } catch (error) {
+            Logger.error(`Error extracting specific item details: ${error.message}`);
+            return { name: null, count: 1 };
         }
     },
 
